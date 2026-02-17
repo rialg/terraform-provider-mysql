@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/go-cty/cty"
@@ -42,6 +43,24 @@ func resourceUser() *schema.Resource {
 		DeleteContext: DeleteUser,
 		Importer: &schema.ResourceImporter{
 			StateContext: ImportUser,
+		},
+
+		CustomizeDiff: func(ctx context.Context, d *schema.ResourceDiff, meta interface{}) error {
+			// Validate max_user_connections is not set on TiDB
+			if _, ok := d.GetOk("max_user_connections"); ok {
+				if err := checkMaxUserConnectionsSupport(ctx, meta); err != nil {
+					return err
+				}
+			}
+
+			// Validate max_statement_time is not set on non-MariaDB
+			if _, ok := d.GetOk("max_statement_time"); ok {
+				if err := checkMaxStatementTimeSupport(ctx, meta); err != nil {
+					return err
+				}
+			}
+
+			return nil
 		},
 
 		Schema: map[string]*schema.Schema{
@@ -154,6 +173,20 @@ func resourceUser() *schema.Resource {
 				Optional: true,
 				Default:  false,
 			},
+
+			"max_user_connections": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				ValidateFunc: validation.IntAtLeast(0),
+				Description:  "Maximum number of simultaneous connections for the user (0 = unlimited). Supported on MySQL 5.0+ and MariaDB.",
+			},
+
+			"max_statement_time": {
+				Type:         schema.TypeFloat,
+				Optional:     true,
+				ValidateFunc: validation.FloatAtLeast(0),
+				Description:  "Maximum execution time for statements in seconds (0 = unlimited). Supports fractional values (e.g., 0.01 for 10ms, 30.5 for 30.5s). Only supported on MariaDB 10.1.1+, not MySQL.",
+			},
 		},
 	}
 }
@@ -171,6 +204,50 @@ func checkDiscardOldPasswordSupport(ctx context.Context, meta interface{}) error
 	if getVersionFromMeta(ctx, meta).LessThan(ver) {
 		return errors.New("MySQL version must be at least 8.0.14")
 	}
+	return nil
+}
+
+func checkMaxUserConnectionsSupport(ctx context.Context, meta interface{}) error {
+	db, err := getDatabaseFromMeta(ctx, meta)
+	if err != nil {
+		return err
+	}
+
+	isTiDB, _, _, err := serverTiDB(db)
+	if err != nil {
+		return err
+	}
+
+	if isTiDB {
+		return errors.New("MAX_USER_CONNECTIONS is not supported on TiDB")
+	}
+
+	return nil
+}
+
+func checkMaxStatementTimeSupport(ctx context.Context, meta interface{}) error {
+	db, err := getDatabaseFromMeta(ctx, meta)
+	if err != nil {
+		return err
+	}
+
+	isMariaDB, err := serverMariaDB(db)
+	if err != nil {
+		return err
+	}
+
+	if !isMariaDB {
+		return errors.New("MAX_STATEMENT_TIME is only supported on MariaDB 10.1.1+, not MySQL")
+	}
+
+	// Check MariaDB version
+	currentVer := getVersionFromMeta(ctx, meta)
+	minVer, _ := version.NewVersion("10.1.1")
+
+	if currentVer.LessThan(minVer) {
+		return fmt.Errorf("MAX_STATEMENT_TIME requires MariaDB 10.1.1 or newer (current version: %s)", currentVer.String())
+	}
+
 	return nil
 }
 
@@ -296,6 +373,35 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 		}
 	}
 
+	// Add resource limits if specified
+	// Note: MySQL 5.6 does NOT support CREATE USER ... WITH for resource limits
+	// MySQL 5.7.6+ supports both CREATE USER ... WITH and ALTER USER ... WITH
+	// For MySQL < 5.7.6, we need to use GRANT USAGE after CREATE USER
+	var resourceLimits []string
+	if createObj != "AADUSER" {
+		// MAX_USER_CONNECTIONS - supported on MySQL and MariaDB, but not TiDB
+		if maxConn, ok := d.GetOk("max_user_connections"); ok {
+			if err := checkMaxUserConnectionsSupport(ctx, meta); err != nil {
+				return diag.FromErr(err)
+			}
+			resourceLimits = append(resourceLimits, fmt.Sprintf("MAX_USER_CONNECTIONS %d", maxConn.(int)))
+		}
+
+		// MAX_STATEMENT_TIME - MariaDB only
+		if maxStmt, ok := d.GetOk("max_statement_time"); ok {
+			if err := checkMaxStatementTimeSupport(ctx, meta); err != nil {
+				return diag.FromErr(err)
+			}
+			resourceLimits = append(resourceLimits, fmt.Sprintf("MAX_STATEMENT_TIME %f", maxStmt.(float64)))
+		}
+
+		// MySQL 5.7.6+ supports CREATE USER ... WITH for resource limits
+		createUserWithVersion, _ := version.NewVersion("5.7.6")
+		if len(resourceLimits) > 0 && getVersionFromMeta(ctx, meta).GreaterThanOrEqual(createUserWithVersion) {
+			stmtSQL += " WITH " + strings.Join(resourceLimits, " ")
+		}
+	}
+
 	// Log statement with sensitive values redacted
 	logStmt := stmtSQL
 	if password != "" {
@@ -309,6 +415,20 @@ func CreateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 	_, err = db.ExecContext(ctx, stmtSQL)
 	if err != nil {
 		return diag.Errorf("failed executing SQL: %v", err)
+	}
+
+	// For MySQL < 5.7.6, use GRANT USAGE to set resource limits after CREATE USER
+	createUserWithVersion, _ := version.NewVersion("5.7.6")
+	if createObj != "AADUSER" && len(resourceLimits) > 0 && getVersionFromMeta(ctx, meta).LessThan(createUserWithVersion) {
+		grantStmtSQL := fmt.Sprintf("GRANT USAGE ON *.* TO %s WITH %s",
+			formatUserIdentifier(user, host),
+			strings.Join(resourceLimits, " "))
+
+		log.Println("[DEBUG] Executing statement:", grantStmtSQL)
+		_, err = db.ExecContext(ctx, grantStmtSQL)
+		if err != nil {
+			return diag.Errorf("failed setting user resource limits: %v", err)
+		}
 	}
 
 	userId := fmt.Sprintf("%s@%s", user, host)
@@ -453,7 +573,102 @@ func UpdateUser(ctx context.Context, d *schema.ResourceData, meta interface{}) d
 		}
 	}
 
+	// Handle resource limits changes (Option B: field removal resets to 0)
+	// MySQL 5.6: ALTER USER only supports PASSWORD EXPIRE, use GRANT USAGE for resource limits
+	// MySQL 5.7.6+: ALTER USER supports WITH clause for resource limits
+	if d.HasChange("max_user_connections") || d.HasChange("max_statement_time") {
+		var resourceLimits []string
+
+		// Handle MAX_USER_CONNECTIONS
+		if maxConn, ok := d.GetOk("max_user_connections"); ok {
+			// Field is present in config, validate and set the value
+			if err := checkMaxUserConnectionsSupport(ctx, meta); err != nil {
+				return diag.FromErr(err)
+			}
+			resourceLimits = append(resourceLimits, fmt.Sprintf("MAX_USER_CONNECTIONS %d", maxConn.(int)))
+		} else if d.HasChange("max_user_connections") {
+			// Field was removed from config, reset to 0 (unlimited)
+			// Only reset if we're not on TiDB (which doesn't support this feature)
+			isTiDBVal, _, _, err := serverTiDB(db)
+			if err != nil {
+				return diag.FromErr(err)
+			}
+			if !isTiDBVal {
+				resourceLimits = append(resourceLimits, "MAX_USER_CONNECTIONS 0")
+			} else {
+				return diag.Errorf("cannot reset max_user_connections on TiDB: MAX_USER_CONNECTIONS is not supported on TiDB")
+			}
+		}
+
+		// Handle MAX_STATEMENT_TIME (MariaDB only)
+		if maxStmt, ok := d.GetOk("max_statement_time"); ok {
+			// Field is present in config, validate and set the value
+			if err := checkMaxStatementTimeSupport(ctx, meta); err != nil {
+				return diag.FromErr(err)
+			}
+			resourceLimits = append(resourceLimits, fmt.Sprintf("MAX_STATEMENT_TIME %f", maxStmt.(float64)))
+		} else if d.HasChange("max_statement_time") {
+			// Field was removed from config, reset to 0 (unlimited)
+			// Only reset if we're on MariaDB (no need to check version, just database type)
+			isMariaDBVal, err := serverMariaDB(db)
+			if err != nil {
+				return diag.FromErr(err)
+			}
+			if isMariaDBVal {
+				resourceLimits = append(resourceLimits, "MAX_STATEMENT_TIME 0")
+			}
+		}
+
+		if len(resourceLimits) > 0 {
+			var stmtSQL string
+
+			// MySQL versions before 5.7.6 don't support ALTER USER with WITH clause
+			// Use GRANT USAGE instead for older versions
+			alterUserVersion, _ := version.NewVersion("5.7.6")
+			if getVersionFromMeta(ctx, meta).LessThan(alterUserVersion) {
+				// MySQL 5.6 and earlier: use GRANT USAGE
+				stmtSQL = fmt.Sprintf("GRANT USAGE ON *.* TO %s WITH %s",
+					formatUserIdentifier(d.Get("user").(string), d.Get("host").(string)),
+					strings.Join(resourceLimits, " "))
+			} else {
+				// MySQL 5.7.6+: use ALTER USER
+				stmtSQL = fmt.Sprintf("ALTER USER %s WITH %s",
+					formatUserIdentifier(d.Get("user").(string), d.Get("host").(string)),
+					strings.Join(resourceLimits, " "))
+			}
+
+			log.Println("[DEBUG] Executing query:", stmtSQL)
+			_, err := db.ExecContext(ctx, stmtSQL)
+			if err != nil {
+				return diag.Errorf("failed setting user resource limits: %v", err)
+			}
+		}
+	}
+
 	return nil
+}
+
+// parseWithClauseSetting extracts and sets a resource limit from the WITH clause
+func parseWithClauseSetting(d *schema.ResourceData, withClause, fieldName, settingName string, parseAsFloat bool) {
+	// Only set if the field is currently being managed (Option B behavior)
+	if _, ok := d.GetOk(fieldName); !ok {
+		return
+	}
+
+	pattern := fmt.Sprintf(`%s\s+([\d.]+)`, settingName)
+	re := regexp.MustCompile(pattern)
+
+	if match := re.FindStringSubmatch(withClause); len(match) > 1 {
+		if parseAsFloat {
+			if value, err := strconv.ParseFloat(match[1], 64); err == nil {
+				d.Set(fieldName, value)
+			}
+		} else {
+			if value, err := strconv.Atoi(match[1]); err == nil {
+				d.Set(fieldName, value)
+			}
+		}
+	}
 }
 
 func ReadUser(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -545,6 +760,20 @@ func ReadUser(ctx context.Context, d *schema.ResourceData, meta interface{}) dia
 					d.Set("auth_string_hex", "")
 				}
 			}
+
+			// Parse resource limits from WITH clause if present
+			// Examples of WITH clause in CREATE USER:
+			// CREATE USER 'user'@'host' ... WITH MAX_USER_CONNECTIONS 10
+			// CREATE USER 'user'@'host' ... WITH MAX_STATEMENT_TIME 30.5 (MariaDB only)
+			// CREATE USER 'user'@'host' ... WITH MAX_USER_CONNECTIONS 5 MAX_STATEMENT_TIME 60.0
+			withRe := regexp.MustCompile(`WITH\s+(.*)$`)
+			if withMatch := withRe.FindStringSubmatch(createUserStmt); len(withMatch) > 1 {
+				withClause := withMatch[1]
+
+				parseWithClauseSetting(d, withClause, "max_user_connections", "MAX_USER_CONNECTIONS", false)
+				parseWithClauseSetting(d, withClause, "max_statement_time", "MAX_STATEMENT_TIME", true)
+			}
+
 			return nil
 		}
 
@@ -552,6 +781,15 @@ func ReadUser(ctx context.Context, d *schema.ResourceData, meta interface{}) dia
 		re2 := regexp.MustCompile("^CREATE USER")
 		if m := re2.FindStringSubmatch(createUserStmt); m != nil {
 			// Ok, we have at least something - it's probably in MariaDB.
+			// Parse resource limits from WITH clause if present (MariaDB format)
+			withRe := regexp.MustCompile(`WITH\s+(.*)$`)
+			if withMatch := withRe.FindStringSubmatch(createUserStmt); len(withMatch) > 1 {
+				withClause := withMatch[1]
+
+				parseWithClauseSetting(d, withClause, "max_user_connections", "MAX_USER_CONNECTIONS", false)
+				parseWithClauseSetting(d, withClause, "max_statement_time", "MAX_STATEMENT_TIME", true)
+			}
+
 			return nil
 		}
 		return diag.Errorf("Create user couldn't be parsed - it is %s", createUserStmt)
